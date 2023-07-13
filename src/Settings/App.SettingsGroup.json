@@ -325,6 +325,18 @@
     "longDesc":  "Host name to forward mavlink to. i.e: localhost:14445",
     "type":             "string",
     "default":     "localhost:14445"
+},
+{
+    "name":             "loginAirLink",
+    "shortDesc":        "AirLink User Name",
+    "type":             "string",
+    "default":          ""
+},
+{
+    "name":             "passAirLink",
+    "shortDesc":        "AirLink Password",
+    "type":             "string",
+    "default":          ""
 }
 ]
 }

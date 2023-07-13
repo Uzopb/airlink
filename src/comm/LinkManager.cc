@@ -24,6 +24,7 @@
 #include "TCPLink.h"
 #include "SettingsManager.h"
 #include "LogReplayLink.h"
+#include "common/mavlink.h"
 #ifdef QGC_ENABLE_BLUETOOTH
 #include "BluetoothLink.h"
 #endif
@@ -74,6 +75,8 @@ LinkManager::LinkManager(QGCApplication* app, QGCToolbox* toolbox)
     qmlRegisterUncreatableType<LinkManager>         ("QGroundControl", 1, 0, "LinkManager",         "Reference only");
     qmlRegisterUncreatableType<LinkConfiguration>   ("QGroundControl", 1, 0, "LinkConfiguration",   "Reference only");
     qmlRegisterUncreatableType<LinkInterface>       ("QGroundControl", 1, 0, "LinkInterface",       "Reference only");
+
+    connect(&_onlineStatusTimer, &QTimer::timeout, this, &LinkManager::_onlineStatusUpdate);
 }
 
 LinkManager::~LinkManager()
@@ -215,6 +218,21 @@ void LinkManager::_linkDisconnected(void)
             return;
         }
     }
+}
+
+void LinkManager::_onlineStatusUpdate()
+{
+    QString pass = qgcApp()->toolbox()->settingsManager()->appSettings()->passAirLink()->rawValueString();
+    QString login = qgcApp()->toolbox()->settingsManager()->appSettings()->loginAirLink()->rawValueString();
+
+    _updateAirLinkState(login, pass);
+
+    if (_isAuth)
+        for (auto const &link : _rgLinkConfigs)
+            link->setOnline(_vehiclesFromServer[link->name()]);
+    else
+        for (auto const &link : _rgLinkConfigs)
+            link->setOnline(false);
 }
 
 SharedLinkInterfacePtr LinkManager::sharedLinkInterfacePointerForLink(LinkInterface* link, bool ignoreNull)
@@ -463,7 +481,6 @@ void LinkManager::_addZeroConfAutoConnectLink(void)
         if(service.type().startsWith("_mavlink._udp")) {
             static QString udpName("ZeroConf UDP");
             if (checkIfConnectionLinkExist(LinkConfiguration::TypeUdp, udpName)) {
-                qCDebug(LinkManagerVerboseLog) << "Connection already exist";
                 return;
             }
 
@@ -479,7 +496,6 @@ void LinkManager::_addZeroConfAutoConnectLink(void)
         if(service.type().startsWith("_mavlink._tcp")) {
             static QString tcpName("ZeroConf TCP");
             if (checkIfConnectionLinkExist(LinkConfiguration::TypeTcp, tcpName)) {
-                qCDebug(LinkManagerVerboseLog) << "Connection already exist";
                 return;
             }
 
@@ -812,6 +828,34 @@ void LinkManager::removeConfiguration(LinkConfiguration* config)
     }
 }
 
+void LinkManager::createConfigurationAirLink()
+{
+    if (_isCreatedConfig)
+        return;
+
+    QString pass = qgcApp()->toolbox()->settingsManager()->appSettings()->passAirLink()->rawValueString();
+
+    for (int i = 0; i < _rgLinkConfigs.count(); i++) {
+        _qmlConfigurations.removeOne(_rgLinkConfigs[i].get());
+    }
+    _rgLinkConfigs.clear();
+
+    quint16 count = 1;
+    foreach (const QString &key, _vehiclesFromServer.keys()) {
+        UDPConfiguration* udp = new UDPConfiguration(key);
+        udp->setPassword(pass);
+        udp->setOnline(_vehiclesFromServer.value(key));
+        udp->addHost("air-link.space", 10000);
+        udp->setLocalPort(udp->localPort() + count++);
+        udp->setLink((SharedLinkInterfacePtr)addConfiguration(udp)->link());
+        udp->setDynamic(false);
+    }
+
+    saveLinkConfigurationList();
+
+    _isCreatedConfig = true;
+}
+
 void LinkManager::_removeConfiguration(LinkConfiguration* config)
 {
     _qmlConfigurations.removeOne(config);
@@ -854,6 +898,34 @@ void LinkManager::startAutoConnectedLinks(void)
         if (conf->isAutoConnect())
             createConnectedLink(conf);
     }
+}
+
+void LinkManager::connectToAirLinkServer(const QString &login, const QString &pass)
+{
+    QNetworkAccessManager *mngr = new QNetworkAccessManager(this);
+
+    const QUrl url("https://air-link.space/api/gs/getModems");
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+
+    QJsonObject obj;
+    obj["login"] = login;
+    obj["password"] = pass;
+    QJsonDocument doc(obj);
+    QByteArray data = doc.toJson();
+
+    _reply = mngr->post(request, data);
+
+    QObject::connect(_reply, &QNetworkReply::finished, [this](){
+        _processReplyAirlinkServer(*_reply);
+        _reply->deleteLater();
+    });
+
+    if (!_onlineStatusTimer.isActive())
+        _onlineStatusTimer.start(_onlineTimeout);
+
+    mngr = nullptr;
+    delete mngr;
 }
 
 uint8_t LinkManager::allocateMavlinkChannel(void)
@@ -907,4 +979,89 @@ bool LinkManager::_isSerialPortConnected(void)
     }
 #endif
     return false;
+}
+
+void LinkManager::_parseAnswer(const QByteArray &ba)
+{
+    QMutexLocker locker(&_mutex);
+    _vehiclesFromServer.clear();
+    for (const auto &arr : QJsonDocument::fromJson(ba)["modems"].toArray())
+        _vehiclesFromServer.insert(arr.toObject()["name"].toString(),
+                                   arr.toObject()["isOnline"].toBool());
+}
+
+void LinkManager::_processReplyAirlinkServer(QNetworkReply &reply)
+{
+    QByteArray ba = reply.readAll();
+
+    if(reply.error() == QNetworkReply::NoError
+            && !QJsonDocument::fromJson(ba)["modems"].toArray().isEmpty()) {
+        _parseAnswer(ba);
+        _isCreatedConfig = false;
+        _isAuthServer = true;        
+        emit authStatusChanged();
+    }  else if (reply.error() == QNetworkReply::NoError
+                && QJsonDocument::fromJson(ba)["modems"].toArray().isEmpty()) {
+        _isAuthServer = false;
+        emit authStatusChanged();
+        _isAuthServer = true;
+    } else {
+        _isConnectServer = false;
+        emit connectStatusChanged();
+        _isConnectServer = true;
+    }
+}
+
+void LinkManager::_updateAirLinkState(const QString &login, const QString &pass)
+{
+    QNetworkAccessManager *mngr = new QNetworkAccessManager(this);
+
+    const QUrl url("https://air-link.space/api/gs/getModems");
+    QNetworkRequest request(url);
+    request.setHeader(QNetworkRequest::ContentTypeHeader, "application/json");
+
+    QJsonObject obj;
+    obj["login"] = login;
+    obj["password"] = pass;
+    QJsonDocument doc(obj);
+    QByteArray data = doc.toJson();
+
+    _replyOnline = mngr->post(request, data);
+
+    QObject::connect(_replyOnline, &QNetworkReply::finished, [this](){
+        QByteArray ba = _replyOnline->readAll();
+        if(_replyOnline->error() == QNetworkReply::NoError
+                && !QJsonDocument::fromJson(ba)["modems"].toArray().isEmpty()) {
+            _parseAnswer(ba);
+            _isAuth = true;
+        } else {
+            _isAuth = false;
+        }
+        _replyOnline->deleteLater();
+    });
+
+    mngr = nullptr;
+    delete mngr;
+}
+
+void LinkManager::sendLoginMsgToAirLink(LinkInterface* link, const QString &login)
+{
+    mavlink_login_airlink_t auth;
+    uint8_t buffer[MAVLINK_MAX_PACKET_LEN];
+    mavlink_message_t mavmsg;
+
+    const QString pass = qgcApp()->toolbox()->settingsManager()->appSettings()->passAirLink()->rawValueString();
+
+    memset(&auth.login, 0, sizeof(auth.login));
+    memset(&auth.password, 0, sizeof(auth.password));
+    strcpy(auth.login, login.toUtf8().constData());
+    strcpy(auth.password, pass.toUtf8().constData());
+
+    mavlink_msg_login_airlink_pack(0, 0, &mavmsg, auth.login, auth.password);
+    uint16_t len = mavlink_msg_to_send_buffer(buffer, &mavmsg);
+    link->writeBytesThreadSafe((const char *)buffer, len);
+
+    qDebug() << (link->isConnected() ? "Connected" : "Not connected");
+    qDebug() << login.toUtf8().constData();
+    qDebug() << pass.toUtf8().constData();
 }
